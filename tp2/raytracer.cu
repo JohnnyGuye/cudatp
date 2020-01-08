@@ -12,7 +12,7 @@
 
 class Sphere {
 public:
-	float size = 1;
+	float size;
 	Vector3 center;
         Vector3 color;
 
@@ -28,35 +28,43 @@ public:
 __global__ void raytrace( Vector3 * image, Sphere * spheres, int width, int height, int sphereCount ) {
 
         int idx = threadIdx.x
-                + threadIdx.y * blockDim.x
+                + threadIdx.y * blockDim.y
                 + blockIdx.x * blockDim.x * blockDim.y;
 
-        printf("%d\n", threadIdx.x + threadIdx.y * blockDim.x);
-        if( width * height < idx ) return;
+	if( width * height <= idx ) return;
+        
+	//printf("%d\n", threadIdx.x + threadIdx.y * blockDim.x);
+        
 
         int i = idx % width;
         int j = idx / height;
+
+	//printf("%d %d %d\n", i, j, idx ); 
 	
-        printf("-- %d %d %d\n", spheres[0].center.r, spheres[0].center.g, spheres[0].center.b );
+        //printf("-- %d %d %d\n", spheres[0].center.r, spheres[0].center.g, spheres[0].center.b );
         Vector3 pos = Vector3( i, j, 0 );
-        auto sphere = spheres[0];
-        auto dist2 = Vector3::distance2( pos, sphere.center );
-        auto sqrSize2 = SQR( sphere.size );
 
-        auto a = (image[ j * width + i ] = Vector3( height,123,156 ) );
-        printf("%d\n", a.r  );
-        if( dist2 < sqrSize2 ){
-		
-                image[ j * width + i ] = Vector3( 1 - (j / (float)height) );
+        image[ idx ] = Vector3( 1 - (j / (float)height) );
 
-        } else {
+        for( auto i = 0; i < sphereCount; i++ ) {
 
-//                //image[ j * width + i ] = sphere.color;
-//                //image[ j * width + i ].r *= 1 - dist2 / sqrSize2;
-//                //image[ j * width + i ].g *= 1 - dist2 / sqrSize2;
-//                //image[ j * width + i ].b *= 1 - dist2 / sqrSize2;
-	
+            auto sphere = spheres[i];
+            auto dist2 = Vector3::distance2( pos, sphere.center );
+            auto sqrSize2 = SQR( sphere.size );
+
+            //auto a = (image[ idx ] = Vector3( height,123,156 ) );
+            //printf("%d\n", a.r  );
+            if( dist2 < sqrSize2 ){
+
+                    image[ idx ] = sphere.color;
+                    image[ idx ].r *= 1 - dist2 / sqrSize2;
+                    image[ idx ].g *= 1 - dist2 / sqrSize2;
+                    image[ idx ].b *= 1 - dist2 / sqrSize2;
+
+            }
+
         }
+
 	
 }
 
@@ -105,13 +113,16 @@ public:
 
 void populateScene( Scene & scene ) {
 
-    Sphere sphere;
-    sphere.center = Vector3( 5, 5, 0 );
-//    sphere.center.r = 50;
-//    sphere.center.g = 50;
-//    sphere.size = 20;
+    Sphere sphere1;
+    sphere1.center = Vector3( 140, 130, 0 );
+    sphere1.size = 100;
 
-    scene.addSphere( sphere );
+    Sphere sphere2;
+    sphere2.center = Vector3( 210, 230, 0 );
+    sphere2.size = 20;
+
+    scene.addSphere( sphere2 );
+    scene.addSphere( sphere1 );
 
 }
 
@@ -124,17 +135,15 @@ int main(int argc, char *argv[]) {
 	Vector3 * d_imgData;
         Sphere * d_spheres;
 
-        int width = 10;
-        int height = 10;
+        int width = 300;
+        int height = 300;
         auto pixelCount = width * height;
 
-        imgData = new Vector3[ width * height ];
+        imgData = new Vector3[ pixelCount ];
 
         Scene scene;
         populateScene( scene );
 	
-        std::cout << scene.spheres[0].center << std::endl;
-
         cudaMalloc( (void **) &d_imgData, pixelCount * sizeof( Vector3 ) );
         cudaMalloc( (void **) &d_spheres, scene.sphereCount * sizeof( Sphere ) );
 
@@ -144,21 +153,18 @@ int main(int argc, char *argv[]) {
         auto totalBlockCount = ceil( pixelCount / (float)(threaddim.x * threaddim.y) );
         dim3 blockdim = dim3( totalBlockCount, 1, 1 );
 
-        raytrace<<< blockdim, threaddim >>>( d_imgData, scene.spheres, width, height, scene.sphereCount );
+        raytrace<<< blockdim, threaddim >>>( d_imgData, d_spheres, width, height, scene.sphereCount );
 
         CHECK_ERROR
 
         cudaDeviceSynchronize ();
 
-        cudaMemcpy( imgData, d_imgData, width * height * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
+        cudaMemcpy( imgData, d_imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
 
         CHECK_ERROR
 
         cudaFree( d_imgData );
         cudaFree( d_spheres );
-
-        printf("Yolo");
-
 
         writeP3( "output.ppm", imgData, width, height );
 
