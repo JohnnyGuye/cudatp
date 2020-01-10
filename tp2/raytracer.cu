@@ -168,9 +168,9 @@ __global__ void raytrace( Vector3 * image, Sphere * spheres, Light * lights, int
 
         auto material = collision.sphere->material;
         auto albedo = material.albedo;
-        auto rough = material.roughness * 0.90 + 0.0;
+        auto rough = material.roughness * 0.97 + 0.03;
         auto metal = material.metalness;
-        auto f0 = albedo * 0.04;
+        auto f0 = albedo * (0.04 * (1-metal) + metal);
 
         auto alpha = SQR( rough );
         auto alpha2 = SQR( alpha );
@@ -185,16 +185,22 @@ __global__ void raytrace( Vector3 * image, Sphere * spheres, Light * lights, int
             auto V = -ray.direction.normalized();
             auto H = (L + V).normalize();
 
-            auto NdotL = dodgeZero( Vector3::dotProduct( N, L ) );
+            auto NdotL = Vector3::dotProduct( N, L );
+
+            if( NdotL < 0 ) continue;
+
             auto NdotV = dodgeZero( Vector3::dotProduct( N, V ) );
             auto NdotH = dodgeZero( Vector3::dotProduct( N, H ) );
 
-            auto D = GGXDistribution( alpha2, NdotH );
+            auto D = GGXDistribution( alpha2, NdotL );
             auto G = GGXGeometry( alpha2, NdotL ) * GGXGeometry( alpha2, NdotV );
             auto F = Fresnel( f0, NdotH );
             auto denom = 4 * NdotL * NdotV;
 
-            color *= albedo * F * G * D/ denom * NdotL;
+            auto spec = F * G * D / denom;
+            auto nonspec = (Vector3(1) - F);
+
+            color *= albedo * (spec + nonspec) / M_PI * NdotL;
 
             image[idx] += color;
         }
@@ -303,7 +309,7 @@ void populateScene( Scene & scene ) {
 //    scene.addSphere( sphere2 );
 
     Light light1;
-    light1.origin = Vector3( 80, 200, -100 );
+    light1.origin = Vector3( 0, 10000, -10000 );
 
     scene.addLight( light1 );
 
