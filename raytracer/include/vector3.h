@@ -36,6 +36,15 @@ public:
             //printf("Copy call %d\n", r);
         }
 
+        GCPU_F bool operator==( const Vector3 & v ) {
+            LOOP_I if( v[i] != values[i]) return false;
+            return true;
+        }
+
+        GCPU_F bool operator!=( const Vector3 & v ) {
+            return !(*this == v);
+        }
+
         GCPU_F Vector3 & operator=( const Vector3 & v ){
             this->r = v.r;
             this->g = v.g;

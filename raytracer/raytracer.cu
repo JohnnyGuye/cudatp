@@ -9,6 +9,16 @@
 #include <cmath>
 
 
+// ==========================================================
+// ============ COMPILATION OPTIONS =========================
+// ==========================================================
+
+const bool OPT_CPU_MAXLUMINANCE = false;
+
+// ==========================================================
+// ============ CLASSES DEFINITIONS =========================
+// ==========================================================
+
 class Ray {
 public:
     Vector3 origin;
@@ -264,6 +274,35 @@ __global__ void tonemap( Vector3 * image, float maxLuminance, Camera camera ) {
 
 }
 
+// https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf
+template< int VERS >
+__global__ void computeMaxLuminance( const Vector3 * in_colors, Vector3 * out_colors, const Camera camera ) {
+
+    extern __shared__ Vector3 sharedData[];
+
+    unsigned int tid    = threadIdx.x;
+    unsigned int i      = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int px     = camera.resolution.x * camera.resolution.y;
+    if( i >= px || tid >= px ) return;
+
+    sharedData[ tid ] = in_colors[ i ];
+    __syncthreads();
+
+    auto lumiL = computeLuminance( sharedData[tid] );
+
+    // The reduction
+    for( unsigned int s = 1; s < blockDim.x; s *= 2 ) {
+        if( tid % (2*s) == 0) {
+            auto lumiR = computeLuminance( sharedData[tid+s] );
+            if( lumiR > lumiL )
+                sharedData[ tid ] = sharedData[tid+s];
+        }
+        __syncthreads();
+    }
+
+    if( tid == 0 ) out_colors[blockIdx.x] = sharedData[0];
+}
+
 void writeP3( std::string fileName, Vector3 * data, int width, int height ) {
 	
 	std::ofstream file;
@@ -381,7 +420,6 @@ void populateScene( Scene & scene ) {
 
 }
 
-const bool OPT_CPU_MAXLUMINANCE = true;
 
 int main(int argc, char *argv[]) {
 
@@ -397,7 +435,7 @@ int main(int argc, char *argv[]) {
         Scene scene;
         populateScene( scene );
 
-        camera.resolution = Vector3( 1024, 1024, 1);
+        camera.resolution = Vector3( 1024, 1024, 0) / 16  + Vector3(0,0,1);
         camera.size = Vector3( 300, 300, 1 );
         camera.position = Vector3( 150, 150, -100 );
 
@@ -431,6 +469,39 @@ int main(int argc, char *argv[]) {
                 if( luminance > maxLuminance ) maxLuminance = luminance;
             }
             cudaMemcpy( d_imgData, imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyHostToDevice );
+
+        } else {
+            // GPU max
+            dim3 threaddim = dim3( 256, 1, 1 );
+            dim3 blockdim = dim3( ceil( pixelCount / (float)(threaddim.x) ), 1, 1 );
+
+            Vector3 * d_reduction;
+            Vector3 * d_reduction2;
+            Vector3 * reduction = new Vector3[ pixelCount ];
+
+            cudaDeviceSynchronize();
+            cudaMalloc( (void **) &d_reduction, pixelCount * sizeof( Vector3 ) );
+//            cudaMalloc( (void **) &d_reduction2, pixelCount * sizeof( Vector3 ) );
+            CHECK_ERROR
+
+            computeMaxLuminance<1><<< blockdim, threaddim, pixelCount * sizeof( Vector3 ) >>>( d_imgData, d_reduction, camera );
+
+            CHECK_ERROR
+            cudaMemcpy( imgData, d_imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
+            CHECK_ERROR
+            cudaMemcpy( reduction, d_reduction, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
+            CHECK_ERROR
+
+            for( unsigned int i = 0; i < pixelCount; i += 2 ) {
+                if( imgData[i] == reduction[i] ) continue;
+                std::cout << "> " << i << std::endl;
+                std::cout << imgData[i] << " " << imgData[i+1] << std::endl;
+                std::cout << reduction[i] << " " << reduction[i+1] << std::endl;
+            }
+            cudaFree( d_reduction );
+            CHECK_ERROR
+
+            maxLuminance = 1;
         }
 
         CHECK_ERROR
