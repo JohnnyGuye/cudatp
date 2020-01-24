@@ -3,8 +3,9 @@
 #include <iostream>
 
 #define LOOP_I for(unsigned i = 0; i < 3; i++)
-class Vector3 {
-public:
+
+struct Vector3 {
+
         union {
             struct {
                 float values[3];
@@ -18,6 +19,11 @@ public:
                 float x;
                 float y;
                 float z;
+            };
+            struct {
+                float u;
+                float v;
+                float s;
             };
         };
 
@@ -49,7 +55,6 @@ public:
             this->r = v.r;
             this->g = v.g;
             this->b = v.b;
-            //printf("Assign call %d\n", r);
             return *this;
         }
 
@@ -211,6 +216,24 @@ public:
             return *this;
         }
 
+        GCPU_F Vector3 & clamp( const Vector3 & min, const Vector3 & max ) {
+            LOOP_I {
+                if( values[i] <= min[i] ) values[i] = min[i];
+                if( values[i] >= max[i] ) values[i] = max[i];
+            }
+
+            return *this;
+        }
+
+        GCPU_F static Vector3 clamp( Vector3 val, const Vector3 & min, const Vector3 & max ) {
+            return val.clamp(min,max);
+        }
+
+        GCPU_F static Vector3 mix( const Vector3 & a, const Vector3 & b, const float ratio ) {
+            return a * (1-ratio) + b * ratio;
+        }
+
+
         friend std::ostream & operator << ( std::ostream & os, const Vector3 & vec ) {
             os << "[" << vec.r << "; " << vec.g << "; " << vec.b << "]";
             return os;
@@ -218,3 +241,6 @@ public:
 
 
 };
+
+
+#undef LOOP_I

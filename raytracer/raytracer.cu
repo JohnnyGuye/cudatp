@@ -19,12 +19,14 @@
 // ============ COMPILATION OPTIONS =========================
 // ==========================================================
 
-const bool OPT_CPU_MAXLUMINANCE = false;
-const int MAX_BOUNCE_DEPTH      = 4;
+constexpr bool OPT_CPU_MAXLUMINANCE = false;
+constexpr int MAX_BOUNCE_DEPTH      = 4;
 
 // ==========================================================
 // ============ CLASSES DEFINITIONS =========================
 // ==========================================================
+
+constexpr float COLLISION_OFFSET = 1e-6;
 
 class Collision {
 public:
@@ -71,7 +73,7 @@ GCPU_F float GGXGeometry( float alpha2, float NdotL ) {
 
 GCPU_F Vector3 Fresnel( const Vector3 & f0, const float NdotH ) {
     auto unary = Vector3(1);
-    return f0 + (unary - f0) * (SQR5(unary - NdotH));
+    return f0 + (unary - f0) * (SQR5(1 - NdotH));
 }
 
 GCPU_F float dodgeZero( float value ) {
@@ -97,19 +99,26 @@ __device__ Vector3 directLight( const Ray & ray, const Collision & collision, Sp
     auto albedo = material.albedo;
     auto rough = material.roughness * 0.97 + 0.03;
     auto metal = material.metalness;
-    auto f0 = albedo * (0.04 * (1-metal) + metal);
+    //auto f0 = albedo * (0.04 * (1-metal) + metal);
+    auto f0 = Vector3::mix( Vector3(0.04), albedo, metal );
 
     auto alpha = SQR( rough );
     auto alpha2 = SQR( alpha );
 
     auto N = collision.normal;
     auto V = -ray.direction.normalized();
-    auto NdotV = dodgeZero( N.dot(V) );
+    auto NdotV = N.dot(V);
+    if( NdotV < 0) {
+        N = -N;
+        NdotV = -NdotV;
+    }
+    NdotV = dodgeZero(NdotV);
+
     auto ggxNdotV = GGXGeometry( alpha2, NdotV );
 
     for( unsigned int i = 0; i < lightCount; i++ ) {
         auto & light = lights[i];
-        auto color = light.color * light.intensity;
+        auto radiance = light.color * light.intensity;
         auto L = (light.origin - collision.hit).normalize();
         auto H = (L + V).normalize();
 
@@ -123,13 +132,15 @@ __device__ Vector3 directLight( const Ray & ray, const Collision & collision, Sp
 
         auto D = GGXDistribution( alpha2, NdotL );
         auto G = GGXGeometry( alpha2, NdotL ) * ggxNdotV;
-        auto F = Fresnel( f0, NdotH );
+        auto F = Fresnel( f0, NdotV );
         auto denom = 4 * NdotL * NdotV;
 
         auto spec = F * G * D / denom;
-        auto nonspec = (Vector3(1) - F);
 
-        color *= albedo * (spec + nonspec) / M_PI * NdotL;
+        auto kS = F;
+        auto kD = (Vector3(1) - kS) * (1 - metal);
+
+        auto color = (kD * albedo/ M_PI + spec) * radiance * NdotL;
 
         retColor += color;
     }
@@ -137,30 +148,76 @@ __device__ Vector3 directLight( const Ray & ray, const Collision & collision, Sp
     return retColor;
 }
 
-
+/**
+ * Follow a ray through the scene and gather its color bouncing back and forth on the objects
+ *
+ */
 template< int DEPTH >
-__device__ void trace( Ray & ray, Vector3 * image, Sphere * spheres, Light * lights, Camera camera, const int sphereCount, const int lightCount ) {
+__device__ Vector3 trace(
+            const Ray & ray,
+            Sphere * spheres,
+            Light * lights,
+            const Camera camera,
+            const int sphereCount,
+            const int lightCount ) {
 
-        image[ idx ] = ((ray.origin - camera.position) / camera.size).abs();
+        Vector3 color;
 
         Collision collision;
-        if( !getFirstCollision( ray, spheres, sphereCount, collision ) ) return;
+        if( !getFirstCollision( ray, spheres, sphereCount, collision ) ) {
+            if( DEPTH == 0 ) {
+                color = ((ray.origin - camera.position) / camera.size).abs();
+            } else {
+                color = trace< MAX_BOUNCE_DEPTH >( ray, spheres, lights, camera, sphereCount, lightCount );
+            }
+            return color;
+        }
 
-        image[ idx ] = directLight(ray, collision, spheres, lights, sphereCount, lightCount);
+        auto N = collision.normal;
+        if( N.dot(ray.direction) > 0 ) {
+            N = -N;
+        }
+
+        auto opacity = collision.sphere->material.opacity;
+
+        Ray reflectedRay;
+        reflectedRay.origin     = ray.origin + collision.normal * COLLISION_OFFSET;
+        reflectedRay.direction  = Ray::reflect( ray.direction, collision.normal ).normalize();
+
+        Ray refractedRay;
+        refractedRay.origin     = ray.origin - collision.normal * COLLISION_OFFSET;
+        refractedRay.direction  = Ray::refract( ray.direction, collision.normal, 1.0f ).normalize();
+
+        auto reflLight = trace< DEPTH + 1 >( reflectedRay, spheres, lights, camera, sphereCount, lightCount ) * opacity;
+        auto refrLight = trace< DEPTH + 1>( refractedRay, spheres, lights, camera, sphereCount, lightCount ) * (1 - opacity);
+        auto iLight = reflLight + refrLight;
+        auto dLight = directLight(ray, collision, spheres, lights, sphereCount, lightCount);
+
+        return dLight + iLight;
 }
 
-template< int DEPTH >
-__device__ void trace<MAX_BOUNCE_DEPTH>( Ray & ray, Vector3 * image, Sphere * spheres, Light * lights, Camera camera, const int sphereCount, const int lightCount ) {
+template<>
+__device__ Vector3 trace<MAX_BOUNCE_DEPTH>(
+        const Ray & ray,
+        Sphere * spheres,
+        Light * lights,
+        const Camera camera,
+        const int sphereCount,
+        const int lightCount ) {
 
-    image[ idx ] = ((ray.origin - camera.position) / camera.size).abs();
-
-    Collision collision;
-    if( !getFirstCollision( ray, spheres, sphereCount, collision ) ) return;
-
-    image[ idx ] = directLight(ray, collision, spheres, lights, sphereCount, lightCount);
+    Vector3 color;
+    return color;
 }
 
-__global__ void raytrace( Vector3 * image, Sphere * spheres, Light * lights, Camera camera, int sphereCount, int lightCount ) {
+
+
+__global__ void raytrace(
+        Vector3 * image,
+        Sphere * spheres,
+        Light * lights,
+        const Camera camera,
+        const int sphereCount,
+        const int lightCount ) {
 
     int width = camera.resolution.x;
     int height = camera.resolution.y;
@@ -174,13 +231,10 @@ __global__ void raytrace( Vector3 * image, Sphere * spheres, Light * lights, Cam
     int i = idx % width;
     int j = height - idx / height;
 
-    Ray ray;
-    ray.origin = Vector3( i, j, -100 );
-    ray.direction = Vector3( 0, 0, 1 );
+    Ray ray = camera.castRayFromPixel( i, j );
+    ray.direction.normalize();
 
-    ray = camera.castRayFromPixel( i, j );
-
-    image[idx] = trace<0>( ray, image, spheres, lights, camera, sphereCount, lightCount );
+    image[idx] = trace< 0 >( ray, spheres, lights, camera, sphereCount, lightCount );
 
 }
 
@@ -194,9 +248,6 @@ __global__ void tonemap( Vector3 * image, float maxLuminance, Camera camera ) {
             + blockIdx.x * blockDim.x * blockDim.y;
 
     if( idx >= width * height ) return;
-
-//    int i = idx % width;
-//    int j = height - idx / height;
 
     auto coeff = (1 + maxLuminance) / maxLuminance;
     auto luminance = computeLuminance(image[idx]);
@@ -314,13 +365,39 @@ void populateScene( Scene & scene ) {
             sphere.center   = Vector3( stepW * (i + 1), stepH * (j + 1), 0 );
             sphere.size     = min( stepW, stepH ) / 2.5f;
 
-            sphere.material.albedo = Vector3(1, 0.6, 0.8);
-            sphere.material.roughness = (float)i/(float)steps;
-            sphere.material.metalness = (float)j/(float)steps;
+            sphere.material.albedo      = Vector3(1, 0.6, 0.8);
+            sphere.material.roughness   = (float)i/(float)steps;
+            sphere.material.metalness   = (float)j/(float)steps;
+            sphere.material.opacity     = 1;
 
             scene.addSphere( sphere );
         }
     }
+
+    {
+        Sphere sphere;
+        sphere.center   = Vector3( 150, 150, 500);
+        sphere.size     = 130;
+
+        sphere.material.albedo      = Vector3(1.0);
+        sphere.material.roughness   = 0.5;
+        sphere.material.metalness   = 0;
+
+        scene.addSphere( sphere );
+    }
+
+    {
+        Sphere sphere;
+        sphere.center   = Vector3( 300, 300, 150);
+        sphere.size     = 60;
+
+        sphere.material.albedo      = Vector3(1.0);
+        sphere.material.roughness   = 0.3;
+        sphere.material.metalness   = 0;
+
+        scene.addSphere( sphere );
+    }
+
 //    Sphere sphere1;
 //    sphere1.center = Vector3( 140, 130, 0 );
 //    sphere1.size = 100;
@@ -455,12 +532,13 @@ int main(int argc, char *argv[]) {
     cudaMemcpy( d_spheres, scene.spheres, scene.sphereCount * sizeof( Sphere ), cudaMemcpyHostToDevice );
     cudaMemcpy( d_lights, scene.lights, scene.lightCount * sizeof( Light ), cudaMemcpyHostToDevice );
 
-    dim3 threaddim = dim3( 32, 32, 1 );
+    dim3 threaddim = dim3( 16, 16, 1 );
     auto totalBlockCount = ceil( pixelCount / (float)(threaddim.x * threaddim.y) );
     dim3 blockdim = dim3( totalBlockCount, 1, 1 );
 
     raytrace<<< blockdim, threaddim >>>( d_imgData, d_spheres, d_lights, camera, scene.sphereCount, scene.lightCount );
 
+    CHECK_ERROR
     cudaMemcpy( imgData, d_imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
     writeP3( "output.ppm", imgData, width, height );
 
@@ -480,7 +558,7 @@ int main(int argc, char *argv[]) {
 
     } else {
         // GPU max
-        dim3 threaddim = dim3( 256, 1, 1 );
+        dim3 threaddim = dim3( 32, 1, 1 );
         dim3 blockdim = dim3( ceil( pixelCount / (float)(threaddim.x) ), 1, 1 );
 
         Vector3 * d_reduction;

@@ -10,7 +10,7 @@ public:
     bool orthogonal = true;
     Vector3 size = Vector3(100,100,0);
 
-    GCPU_F Ray castRayFromPixel( int x, int y ) {
+    GCPU_F Ray castRayFromPixel( const int x, const int y ) const {
         if( orthogonal ) {
             Ray ray;
             ray.origin = (Vector3(x,y,0) / resolution - 0.5f) * size + position;
