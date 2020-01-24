@@ -5,6 +5,12 @@
 
 #include "cuda.def.cuh"
 #include "vector3.h"
+#include "ray.h"
+#include "camera.h"
+#include "material.h"
+#include "sphere.h"
+#include "light.h"
+
 #include <fstream>
 #include <cmath>
 
@@ -14,109 +20,11 @@
 // ==========================================================
 
 const bool OPT_CPU_MAXLUMINANCE = false;
+const int MAX_BOUNCE_DEPTH      = 4;
 
 // ==========================================================
 // ============ CLASSES DEFINITIONS =========================
 // ==========================================================
-
-class Ray {
-public:
-    Vector3 origin;
-    Vector3 direction;
-
-    GCPU_F Ray( const Vector3 & origin, const Vector3 & direction )
-        : origin( origin ), direction( direction ) {}
-
-    GCPU_F Ray( const Vector3 & direction )
-        : Ray( 0, direction ) {}
-
-    GCPU_F Ray( )
-        : Ray( Vector3(1, 0, 0) ) {}
-
-};
-
-class Material {
-public:
-    Vector3 albedo;
-    float roughness = 0;
-    float metalness = 0;
-};
-
-class Camera {
-public:
-    Vector3 resolution  = Vector3(100,100,1);
-    Vector3 direction   = Vector3(0,0,1);
-    Vector3 up          = Vector3(0,1,0);
-    Vector3 position    = Vector3(0,0,-100);
-
-    bool orthogonal = true;
-    Vector3 size = Vector3(100,100,0);
-
-    GCPU_F Ray castRayFromPixel( int x, int y ) {
-        if( orthogonal ) {
-            Ray ray;
-            ray.origin = (Vector3(x,y,0) / resolution - 0.5f) * size + position;
-            ray.direction = direction;
-            return ray;
-        } else {
-            Ray ray;
-            return ray;
-        }
-    }
-
-};
-
-class Sphere {
-public:
-        float size = 1;
-	Vector3 center;
-        Material material;
-
-        GCPU_F Sphere()
-            : size(1), center( 0.0 ){}
-
-        GCPU_F Sphere( Sphere & sphere )
-            : size( sphere.size ), center( sphere.center ), material( sphere.material ) {}
-
-        GCPU_F Vector3 normalAt( const Vector3 & hit ) const {
-            return (hit - center).normalize();
-        }
-
-        GCPU_F bool intersects( const Vector3 & origin, const Vector3 & direction, Vector3 & hit, float & distance ) const {
-            auto m = origin - center;
-            float b = Vector3::dot( m, direction );
-            float c = m.length2() - SQR( size );
-
-            if( c > 0.0f && b > 0.0f ) return false;
-            float discr = SQR( b ) - c;
-
-            if( discr < 0.0f ) return false;
-            auto t = -b - sqrt( discr );
-
-            if( t < 0.0f ) t = -b + sqrt( discr );
-
-            hit = origin + direction * t;
-            distance = t;
-
-            return true;
-        }
-
-        friend std::ostream & operator << ( std::ostream & os, const Sphere & sphere ) {
-            os << "Sphere: radius: " << sphere.size
-               << " center: " << sphere.center
-               << " color: " << sphere.material.albedo;
-            return os;
-        }
-};
-
-class Light {
-public:
-    Vector3 origin;
-    Vector3 color = 1;
-    float intensity = 1;
-
-    Light() {}
-};
 
 class Collision {
 public:
@@ -176,82 +84,104 @@ GCPU_F float computeLuminance( const Vector3 & color ) {
     return color.dot(Vector3(0.2126f, 0.7152f, 0.0722f));
 }
 
-__global__ void raytrace( Vector3 * image, Sphere * spheres, Light * lights, Camera camera, int sphereCount, int lightCount ) {
 
-        int width = camera.resolution.x;
-        int height = camera.resolution.y;
+/**
+* Compute the light received on a specific point
+* @param ray i
+*/
+__device__ Vector3 directLight( const Ray & ray, const Collision & collision, Sphere * spheres, Light * lights, const int sphereCount, const int lightCount) {
 
-        int idx = threadIdx.x
-                + threadIdx.y * blockDim.y
-                + blockIdx.x * blockDim.x * blockDim.y;
+    Vector3 retColor;
 
-        if( idx >= width * height ) return;
-        
-	//printf("%d\n", threadIdx.x + threadIdx.y * blockDim.x);
-        
+    auto material = collision.sphere->material;
+    auto albedo = material.albedo;
+    auto rough = material.roughness * 0.97 + 0.03;
+    auto metal = material.metalness;
+    auto f0 = albedo * (0.04 * (1-metal) + metal);
 
-        int i = idx % width;
-        int j = height - idx / height;
+    auto alpha = SQR( rough );
+    auto alpha2 = SQR( alpha );
 
-//        printf("%d %d %d\n", i, j, idx );
-	
-        //printf("-- %d %d %d\n", spheres[0].center.r, spheres[0].center.g, spheres[0].center.b );
+    auto N = collision.normal;
+    auto V = -ray.direction.normalized();
+    auto NdotV = dodgeZero( N.dot(V) );
+    auto ggxNdotV = GGXGeometry( alpha2, NdotV );
 
-        Ray ray;
-        ray.origin = Vector3( i, j, -100 );
-        ray.direction = Vector3( 0, 0, 1 );
+    for( unsigned int i = 0; i < lightCount; i++ ) {
+        auto & light = lights[i];
+        auto color = light.color * light.intensity;
+        auto L = (light.origin - collision.hit).normalize();
+        auto H = (L + V).normalize();
 
-        ray = camera.castRayFromPixel( i, j );
+        auto NdotL = Vector3::dot( N, L );
 
-//        printf("%f %f %f\n", ray.origin.x, ray.origin.y, ray.origin.z);
-//        image[ idx ] = (ray.origin / camera.resolution * 2 + 1).abs();
+        if( NdotL <= 0 ) continue;
+
+        auto NdotH = dodgeZero( N.dot(H) );
+
+        NdotL = dodgeZero( NdotL );
+
+        auto D = GGXDistribution( alpha2, NdotL );
+        auto G = GGXGeometry( alpha2, NdotL ) * ggxNdotV;
+        auto F = Fresnel( f0, NdotH );
+        auto denom = 4 * NdotL * NdotV;
+
+        auto spec = F * G * D / denom;
+        auto nonspec = (Vector3(1) - F);
+
+        color *= albedo * (spec + nonspec) / M_PI * NdotL;
+
+        retColor += color;
+    }
+
+    return retColor;
+}
+
+
+template< int DEPTH >
+__device__ void trace( Ray & ray, Vector3 * image, Sphere * spheres, Light * lights, Camera camera, const int sphereCount, const int lightCount ) {
+
         image[ idx ] = ((ray.origin - camera.position) / camera.size).abs();
 
         Collision collision;
         if( !getFirstCollision( ray, spheres, sphereCount, collision ) ) return;
 
-        //image[ idx ] = collision.sphere->color;
+        image[ idx ] = directLight(ray, collision, spheres, lights, sphereCount, lightCount);
+}
 
-        auto material = collision.sphere->material;
-        auto albedo = material.albedo;
-        auto rough = material.roughness * 0.97 + 0.03;
-        auto metal = material.metalness;
-        auto f0 = albedo * (0.04 * (1-metal) + metal);
+template< int DEPTH >
+__device__ void trace<MAX_BOUNCE_DEPTH>( Ray & ray, Vector3 * image, Sphere * spheres, Light * lights, Camera camera, const int sphereCount, const int lightCount ) {
 
-        auto alpha = SQR( rough );
-        auto alpha2 = SQR( alpha );
+    image[ idx ] = ((ray.origin - camera.position) / camera.size).abs();
 
-        image[ idx ] = 0;
+    Collision collision;
+    if( !getFirstCollision( ray, spheres, sphereCount, collision ) ) return;
 
-        for( unsigned int i = 0; i < lightCount; i++ ) {
-            auto & light = lights[i];
-            auto color = light.color * light.intensity;
-            auto L = (light.origin - collision.hit).normalize();
-            auto N = collision.normal;
-            auto V = -ray.direction.normalized();
-            auto H = (L + V).normalize();
+    image[ idx ] = directLight(ray, collision, spheres, lights, sphereCount, lightCount);
+}
 
-            auto NdotL = Vector3::dot( N, L );
+__global__ void raytrace( Vector3 * image, Sphere * spheres, Light * lights, Camera camera, int sphereCount, int lightCount ) {
 
-            if( NdotL <= 0 ) continue;
+    int width = camera.resolution.x;
+    int height = camera.resolution.y;
 
-            auto NdotV = dodgeZero( N.dot(V) );
-            auto NdotH = dodgeZero( N.dot(H) );
+    int idx = threadIdx.x
+            + threadIdx.y * blockDim.y
+            + blockIdx.x * blockDim.x * blockDim.y;
 
-            NdotL = dodgeZero( NdotL );
+    if( idx >= width * height ) return;
 
-            auto D = GGXDistribution( alpha2, NdotL );
-            auto G = GGXGeometry( alpha2, NdotL ) * GGXGeometry( alpha2, NdotV );
-            auto F = Fresnel( f0, NdotH );
-            auto denom = 4 * NdotL * NdotV;
+    int i = idx % width;
+    int j = height - idx / height;
 
-            auto spec = F * G * D / denom;
-            auto nonspec = (Vector3(1) - F);
+    Ray ray;
+    ray.origin = Vector3( i, j, -100 );
+    ray.direction = Vector3( 0, 0, 1 );
 
-            color *= albedo * (spec + nonspec) / M_PI * NdotL;
+    ray = camera.castRayFromPixel( i, j );
 
-            image[idx] += color;
-        }	
+    image[idx] = trace<0>( ray, image, spheres, lights, camera, sphereCount, lightCount );
+
 }
 
 __global__ void tonemap( Vector3 * image, float maxLuminance, Camera camera ) {
@@ -420,104 +350,183 @@ void populateScene( Scene & scene ) {
 
 }
 
+class ArgParser {
+    int argc = 0;
+    char ** argv;
+
+    int currentArg = 1;
+public:
+    ArgParser( int argc, char * argv[] )
+        : argc(argc),argv(argv){}
+
+    char * programCall() const {
+        return argv[0];
+    }
+
+    void reset() {
+        this->currentArg = 1;
+    }
+
+    int next() {
+      return ++this->currentArg;
+    }
+
+    bool canGet() const {
+        return this->currentArg < this->argc;
+    }
+
+    bool hasNext() const {
+        return this->currentArg + 1 < this->argc;
+    }
+
+    char * getAndMove() {
+        return this->argv[this->currentArg++];
+    }
+
+    char * current() const {
+        return this->argv[this->currentArg];
+    }
+
+    int count() const {
+        return argc-1;
+    }
+
+    int currentIdx() const {
+        return currentArg;
+    }
+
+    int remaining() const {
+        return count() - currentIdx();
+    }
+};
 
 int main(int argc, char *argv[]) {
 
-        cudaDeviceReset();
+    auto argParser = ArgParser(argc,argv);
 
-	Vector3 * imgData;
+    Camera camera;
+    camera.resolution = Vector3( 1024, 1024, 0) / 16  + Vector3(0,0,1);
+    camera.size = Vector3( 300, 300, 1 );
+    camera.position = Vector3( 150, 150, -100 );
 
-	Vector3 * d_imgData;
-        Sphere * d_spheres;
-        Light * d_lights;
-
-        Camera camera;
-        Scene scene;
-        populateScene( scene );
-
-        camera.resolution = Vector3( 1024, 1024, 0) / 16  + Vector3(0,0,1);
-        camera.size = Vector3( 300, 300, 1 );
-        camera.position = Vector3( 150, 150, -100 );
-
-        int width = camera.resolution.x;
-        int height = camera.resolution.y;
-        auto pixelCount = width * height;
-
-        imgData = new Vector3[ pixelCount ];
-	
-        cudaMalloc( (void **) &d_imgData, pixelCount * sizeof( Vector3 ) );
-        cudaMalloc( (void **) &d_spheres, scene.sphereCount * sizeof( Sphere ) );
-        cudaMalloc( (void **) &d_lights, scene.lightCount * sizeof( Light ) );
-
-        cudaMemcpy( d_spheres, scene.spheres, scene.sphereCount * sizeof( Sphere ), cudaMemcpyHostToDevice );
-        cudaMemcpy( d_lights, scene.lights, scene.lightCount * sizeof( Light ), cudaMemcpyHostToDevice );
-
-        dim3 threaddim = dim3( 32, 32, 1 );
-        auto totalBlockCount = ceil( pixelCount / (float)(threaddim.x * threaddim.y) );
-        dim3 blockdim = dim3( totalBlockCount, 1, 1 );
-
-        raytrace<<< blockdim, threaddim >>>( d_imgData, d_spheres, d_lights, camera, scene.sphereCount, scene.lightCount );
-
-        float maxLuminance = 0;
-
-        if( OPT_CPU_MAXLUMINANCE ) {
-            // CPU max
-            cudaDeviceSynchronize();
-            cudaMemcpy( imgData, d_imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
-            for( unsigned int i = 0; i < pixelCount; i++ ) {
-                auto luminance = computeLuminance( imgData[i] );
-                if( luminance > maxLuminance ) maxLuminance = luminance;
+    for( argParser.reset(); argParser.canGet(); argParser.next() ) {
+        auto current = argParser.current();
+        std::cout << "Parsing: " << current << " | Remaining: " << argParser.remaining() << std::endl;
+        if( std::string(current) == "-res" && argParser.remaining() >= 2) {
+            {
+                std::stringstream ss;
+                argParser.next();
+                ss << argParser.current();
+                ss >> camera.resolution.x;
             }
-            cudaMemcpy( d_imgData, imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyHostToDevice );
-
-        } else {
-            // GPU max
-            dim3 threaddim = dim3( 256, 1, 1 );
-            dim3 blockdim = dim3( ceil( pixelCount / (float)(threaddim.x) ), 1, 1 );
-
-            Vector3 * d_reduction;
-            Vector3 * d_reduction2;
-            Vector3 * reduction = new Vector3[ pixelCount ];
-
-            cudaDeviceSynchronize();
-            cudaMalloc( (void **) &d_reduction, pixelCount * sizeof( Vector3 ) );
-//            cudaMalloc( (void **) &d_reduction2, pixelCount * sizeof( Vector3 ) );
-            CHECK_ERROR
-
-            computeMaxLuminance<1><<< blockdim, threaddim, pixelCount * sizeof( Vector3 ) >>>( d_imgData, d_reduction, camera );
-
-            CHECK_ERROR
-            cudaMemcpy( imgData, d_imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
-            CHECK_ERROR
-            cudaMemcpy( reduction, d_reduction, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
-            CHECK_ERROR
-
-            for( unsigned int i = 0; i < pixelCount; i += 2 ) {
-                if( imgData[i] == reduction[i] ) continue;
-                std::cout << "> " << i << std::endl;
-                std::cout << imgData[i] << " " << imgData[i+1] << std::endl;
-                std::cout << reduction[i] << " " << reduction[i+1] << std::endl;
+            {
+                std::stringstream ss;
+                argParser.next();
+                ss << argParser.current();
+                ss >> camera.resolution.y;
             }
-            cudaFree( d_reduction );
-            CHECK_ERROR
-
-            maxLuminance = 1;
+            std::cout << "Resolution is set to " << camera.resolution << std::endl;
         }
+    }
 
-        CHECK_ERROR
+    cudaDeviceReset();
 
-        tonemap<<< blockdim, threaddim >>>( d_imgData, maxLuminance, camera );
+    Vector3 * imgData;
 
+    Vector3 * d_imgData;
+    Sphere * d_spheres;
+    Light * d_lights;
+
+
+    Scene scene;
+    populateScene( scene );
+
+
+    int width = camera.resolution.x;
+    int height = camera.resolution.y;
+    auto pixelCount = width * height;
+
+    imgData = new Vector3[ pixelCount ];
+
+    cudaMalloc( (void **) &d_imgData, pixelCount * sizeof( Vector3 ) );
+    cudaMalloc( (void **) &d_spheres, scene.sphereCount * sizeof( Sphere ) );
+    cudaMalloc( (void **) &d_lights, scene.lightCount * sizeof( Light ) );
+
+    cudaMemcpy( d_spheres, scene.spheres, scene.sphereCount * sizeof( Sphere ), cudaMemcpyHostToDevice );
+    cudaMemcpy( d_lights, scene.lights, scene.lightCount * sizeof( Light ), cudaMemcpyHostToDevice );
+
+    dim3 threaddim = dim3( 32, 32, 1 );
+    auto totalBlockCount = ceil( pixelCount / (float)(threaddim.x * threaddim.y) );
+    dim3 blockdim = dim3( totalBlockCount, 1, 1 );
+
+    raytrace<<< blockdim, threaddim >>>( d_imgData, d_spheres, d_lights, camera, scene.sphereCount, scene.lightCount );
+
+    cudaMemcpy( imgData, d_imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
+    writeP3( "output.ppm", imgData, width, height );
+
+
+    // Apply tonemapping
+    float maxLuminance = 0;
+
+    if( OPT_CPU_MAXLUMINANCE ) {
+        // CPU max
         cudaDeviceSynchronize();
         cudaMemcpy( imgData, d_imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
+        for( unsigned int i = 0; i < pixelCount; i++ ) {
+            auto luminance = computeLuminance( imgData[i] );
+            if( luminance > maxLuminance ) maxLuminance = luminance;
+        }
+        cudaMemcpy( d_imgData, imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyHostToDevice );
 
+    } else {
+        // GPU max
+        dim3 threaddim = dim3( 256, 1, 1 );
+        dim3 blockdim = dim3( ceil( pixelCount / (float)(threaddim.x) ), 1, 1 );
+
+        Vector3 * d_reduction;
+        Vector3 * d_reduction2;
+        Vector3 * reduction = new Vector3[ pixelCount ];
+
+        cudaDeviceSynchronize();
+        cudaMalloc( (void **) &d_reduction, pixelCount * sizeof( Vector3 ) );
+//            cudaMalloc( (void **) &d_reduction2, pixelCount * sizeof( Vector3 ) );
         CHECK_ERROR
 
-        cudaFree( d_imgData );
-        cudaFree( d_spheres );
-        cudaFree( d_lights );
 
-        writeP3( "output.ppm", imgData, width, height );
+        computeMaxLuminance<1><<< blockdim, threaddim, pixelCount * sizeof( Vector3 ) >>>( d_imgData, d_reduction, camera );
 
-        delete [] imgData;
+        CHECK_ERROR
+        cudaMemcpy( imgData, d_imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
+        CHECK_ERROR
+        cudaMemcpy( reduction, d_reduction, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
+        CHECK_ERROR
+
+        for( unsigned int i = 0; i < pixelCount; i += 2 ) {
+            if( imgData[i] == reduction[i] ) continue;
+//            std::cout << "> " << i << std::endl;
+//            std::cout << imgData[i] << " " << imgData[i+1] << std::endl;
+//            std::cout << reduction[i] << " " << reduction[i+1] << std::endl;
+        }
+        cudaFree( d_reduction );
+        CHECK_ERROR
+
+        maxLuminance = 1;
+    }
+
+    CHECK_ERROR
+
+    tonemap<<< blockdim, threaddim >>>( d_imgData, maxLuminance, camera );
+
+    cudaDeviceSynchronize();
+    cudaMemcpy( imgData, d_imgData, pixelCount * sizeof( Vector3 ), cudaMemcpyDeviceToHost );
+
+    CHECK_ERROR
+
+    cudaFree( d_imgData );
+    cudaFree( d_spheres );
+    cudaFree( d_lights );
+
+    writeP3( "output_t.ppm", imgData, width, height );
+
+    delete [] imgData;
 }
